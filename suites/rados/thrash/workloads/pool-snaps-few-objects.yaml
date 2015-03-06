@@ -1,5 +1,6 @@
 tasks:
 - rados:
+    dont_cleanup_pools: true
     clients: [client.0]
     ops: 4000
     objects: 50

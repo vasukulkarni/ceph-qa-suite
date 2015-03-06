@@ -4,6 +4,7 @@ overrides:
 tasks:
 - rados:
     clients: [client.0]
+    dont_cleanup_pools: true
     ops: 4000
     objects: 500
     op_weights:

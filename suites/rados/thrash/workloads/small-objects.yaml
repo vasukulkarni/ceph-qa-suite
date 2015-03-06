@@ -4,6 +4,7 @@ overrides:
 tasks:
 - rados:
     clients: [client.0]
+    dont_cleanup_pools: true
     ops: 400000
     max_seconds: 600
     max_in_flight: 64
