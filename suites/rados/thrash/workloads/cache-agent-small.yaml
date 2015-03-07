@@ -3,6 +3,8 @@ overrides:
     crush_tunables: firefly
     log-whitelist:
       - must scrub before tier agent can activate
+    conf:
+		  osd debug scrub chance rewrite digest = 50
 tasks:
 - exec:
     client.0:

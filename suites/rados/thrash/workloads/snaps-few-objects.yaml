@@ -1,3 +1,7 @@
+overrides:
+  ceph:
+    conf:
+		  osd debug scrub chance rewrite digest = 50
 tasks:
 - rados:
     clients: [client.0]
