@@ -33,6 +33,7 @@ def task(ctx, config):
 	  write_fadvise_dontneed: write behavior like with LIBRADOS_OP_FLAG_FADVISE_DONTNEED.
 	                          This mean data don't access in the near future.
 				  Let osd backend don't keep data in cache.
+          dont_cleanup_pools: leave pools around for scrub
 
     For example::
 
@@ -184,8 +185,9 @@ def task(ctx, config):
                 tests[id_] = proc
             run.wait(tests.itervalues())
 
-            for pool in created_pools:
-                ctx.manager.remove_pool(pool)
+            if not config.get('dont_cleanup_pools', False):
+                for pool in created_pools:
+                    ctx.manager.remove_pool(pool)
 
     running = gevent.spawn(thread)
 

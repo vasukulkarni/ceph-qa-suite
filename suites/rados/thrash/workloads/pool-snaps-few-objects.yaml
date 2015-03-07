@@ -1,5 +1,10 @@
+overrides:
+  ceph:
+    conf:
+		  osd debug scrub chance rewrite digest = 50
 tasks:
 - rados:
+    dont_cleanup_pools: true
     clients: [client.0]
     ops: 4000
     objects: 50
