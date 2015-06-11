@@ -6,7 +6,6 @@ import logging
 import os
 import requests
 import shutil
-import subprocess
 import webbrowser
 
 from cStringIO import StringIO
@@ -16,7 +15,16 @@ from teuthology import misc
 
 log = logging.getLogger(__name__)
 
-ICE_VERSION_DEFAULT = '1.2.2'
+
+DEFAULTS = {
+    'version': 'v0.80.9',
+    'test_image': None,
+    'start_browser': False,
+    'email': 'x@y.com',
+    'no_epel': True,
+    'calamari_user': 'admin',
+    'calamari_password': 'admin',
+}
 
 
 @contextlib.contextmanager
@@ -26,35 +34,27 @@ def task(ctx, config):
 
     - calamari_setup:
         version: 'v80.1'
-        ice_tool_dir: <directory>
-        iceball_location: <directory>
+        test_image: <path to tarball or iso>
 
-    Options are:
+    Options are (see DEFAULTS above):
 
-    version -- ceph version we are testing against (defaults to 80.1)
-    ice_tool_dir -- optional local directory where ice-tool exists or will
-                    be loaded (defaults to src in home directory)
-    ice_version  -- version of ICE we're testing (with default)
-    iceball_location -- Can be an HTTP URL, in which case fetch from this
-                        location, using 'ice_version' and distro information
-                        to select the right tarball.  Can also be a local
-                        path.  If local path is '.', and iceball is
-                        not already present, then we try to build
-                        an iceball using the ice_tool_dir commands.
-    ice_git_location -- location of ice tool on git
+    version -- ceph version we are testing against
+    test_image -- Can be an HTTP URL, in which case fetch from this
+                  http path; can also be local path
     start_browser -- If True, start a browser.  To be used by runs that will
                      bring up a browser quickly for human use.  Set to False
                      for overnight suites that are testing for problems in
-                     the installation itself (defaults to False).
-    email -- email address for the user (defaults to x@y.com)
+                     the installation itself
+    email -- email address for the user
     no_epel -- indicates if we should remove epel files prior to yum
-               installations.  Defaults to True.
-    calamari_user -- user name to log into gui (defaults to admin)
-    calamari_password -- calamari user password (defaults to admin)
+               installations.
+    calamari_user -- user name to log into gui
+    calamari_password -- calamari user password
     """
+    local_config = DEFAULTS
+    local_config.update(config)
+    config = local_config
     cal_svr = None
-    start_browser = config.get('start_browser', False)
-    no_epel = config.get('no_epel', True)
     for remote_, roles in ctx.cluster.remotes.items():
         if 'client.0' in roles:
             cal_svr = remote_
@@ -62,11 +62,11 @@ def task(ctx, config):
     if not cal_svr:
         raise RuntimeError('client.0 not found in roles')
     with contextutil.nested(
-        lambda: adjust_yum_repos(ctx, cal_svr, no_epel),
+        lambda: adjust_yum_repos(ctx, cal_svr, config['no_epel']),
         lambda: calamari_install(config, cal_svr),
         lambda: ceph_install(ctx, cal_svr),
         lambda: calamari_connect(ctx, cal_svr),
-        lambda: browser(start_browser, cal_svr.hostname),
+        lambda: browser(config['start_browser'], cal_svr.hostname),
     ):
         yield
 
@@ -153,23 +153,20 @@ def fix_yum_repos(remote, distro):
     return True
 
 
-def get_iceball_with_http(urlbase, ice_version, ice_distro, destdir):
+def get_iceball_with_http(url, destdir):
     '''
-    Copy iceball with http to destdir
+    Copy iceball with http to destdir.  Try both .tar.gz and .iso.
     '''
-    url = '/'.join((
-        urlbase,
-        '{ver}/ICE-{ver}-{distro}.tar.gz'.format(
-            ver=ice_version, distro=ice_distro
-        )
-    ))
     # stream=True means we don't download until copyfileobj below,
     # and don't need a temp file
     r = requests.get(url, stream=True)
-    filename = url.split('/')[-1]
+    if not r.ok:
+        raise RuntimeError("Failed to download %s", str(url))
+    filename = os.path.join(destdir, url.split('/')[-1])
     with open(filename, 'w') as f:
         shutil.copyfileobj(r.raw, f)
     log.info('saved %s as %s' % (url, filename))
+    return filename
 
 
 @contextlib.contextmanager
@@ -178,91 +175,84 @@ def calamari_install(config, cal_svr):
     Install calamari
 
     The steps here are:
-        -- Get the iceball, building it if necessary.
-        -- Copy the iceball to the calamari server, and untarring it.
-        -- Running ice-setup.py on the calamari server.
-        -- Running calamari-ctl initialize.
+        -- Get the iceball, locally or from http
+        -- Copy the iceball to the calamari server, and untar/mount it.
+        -- Run ice-setup on the calamari server.
+        -- Run calamari-ctl initialize.
     """
-    ice_distro = str(cal_svr.os)
-    ice_distro = ice_distro.replace(" ", "")
     client_id = str(cal_svr)
     at_loc = client_id.find('@')
     if at_loc > 0:
         client_id = client_id[at_loc + 1:]
-    convert = {'ubuntu12.04': 'precise', 'ubuntu14.04': 'trusty',
-               'rhel7.0': 'rhel7', 'debian7': 'wheezy'}
-    version = config.get('version', 'v0.80.1')
-    email = config.get('email', 'x@x.com')
-    ice_tool_dir = config.get('ice_tool_dir', '%s%s%s' %
-                              (os.environ['HOME'], os.sep, 'src'))
-    calamari_user = config.get('calamari_user', 'admin')
-    calamari_password = config.get('calamari_passwd', 'admin')
-    git_icetool_loc = config.get('ice_git_location',
-                                 'git@github.com:inktankstorage')
-    if ice_distro in convert:
-        ice_distro = convert[ice_distro]
-    log.info('calamari server on %s' % ice_distro)
-    iceball_loc = config.get('iceball_location', '.')
-    ice_version = config.get('ice_version', ICE_VERSION_DEFAULT)
-    delete_iceball = False
-    if iceball_loc.startswith('http'):
-        get_iceball_with_http(iceball_loc, ice_version, ice_distro, '/tmp')
-        iceball_loc = '/tmp'
-        delete_iceball = True
-    elif iceball_loc == '.':
-        ice_tool_loc = os.path.join(ice_tool_dir, 'ice-tools')
-        if not os.path.isdir(ice_tool_loc):
-            try:
-                subprocess.check_call(['git', 'clone',
-                                       git_icetool_loc + os.sep +
-                                       'ice-tools.git',
-                                       ice_tool_loc])
-            except subprocess.CalledProcessError:
-                raise RuntimeError('git clone of ice-tools failed')
-        exec_ice = os.path.join(ice_tool_loc,
-                                'teuth-virtenv/bin/make_iceball')
-        try:
-            subprocess.check_call('virtualenv teuth-virtenv'.split(),
-                                  cwd=ice_tool_loc)
-            subprocess.check_call(
-                'teuth-virtenv/bin/python setup.py develop'.split(),
-                cwd=ice_tool_loc
-            )
-            subprocess.check_call(
-                'teuth-virtenv/bin/pip install -r requirements.txt'.split(),
-                cwd=ice_tool_loc
-            )
-            subprocess.check_call([exec_ice, '-I', ice_version,
-                                   '-b', version, '-o', ice_distro])
-            delete_iceball = True
-        except subprocess.CalledProcessError:
-            raise RuntimeError('%s failed for %s distro' %
-                               (exec_ice, ice_distro))
-        subprocess.check_call('rm -rf teuth-virtenv'.split(),
-                              cwd=ice_tool_loc)
 
-    gz_file = 'ICE-{0}-{1}.tar.gz'.format(ice_version, ice_distro)
-    lgz_file = os.path.join(iceball_loc, gz_file)
-    cal_svr.put_file(lgz_file, os.path.join('/tmp/', gz_file))
-    ret = cal_svr.run(args=['gunzip', run.Raw('<'), "/tmp/%s" % gz_file,
-                      run.Raw('|'), 'tar', 'xvf', run.Raw('-')])
+    test_image = config['test_image']
+
+    if not test_image:
+        raise RuntimeError('Must supply test image')
+    log.info('calamari test image: %s' % test_image)
+    delete_iceball = False
+
+    if test_image.startswith('http'):
+        iceball_file = get_iceball_with_http(test_image, '/tmp')
+        delete_iceball = True
+    else:
+        iceball_file = test_image
+
+    remote_iceball_file = os.path.join('/tmp', os.path.split(iceball_file)[1])
+    cal_svr.put_file(iceball_file, remote_iceball_file)
+    if iceball_file.endswith('.tar.gz'):   # XXX specify tar/iso in config?
+        icetype = 'tarball'
+    elif iceball_file.endswith('.iso'):
+        icetype = 'iso'
+    else:
+        raise RuntimeError('Can''t handle iceball {0}'.format(iceball_file))
+
+    if icetype == 'tarball':
+        ret = cal_svr.run(args=['gunzip', run.Raw('<'), remote_iceball_file,
+                          run.Raw('|'), 'tar', 'xvf', run.Raw('-')])
+        if ret.exitstatus:
+            raise RuntimeError('remote iceball untar failed')
+    elif icetype == 'iso':
+        mountpoint = '/mnt/'   # XXX create?
+        ret = cal_svr.run(
+            args=['sudo', 'mount', '-o', 'loop', '-r',
+                  remote_iceball_file, mountpoint]
+        )
+
+    # install ice_setup package
+    args = {
+        'deb': 'sudo dpkg -i /mnt/ice-setup*deb',
+        'rpm': 'sudo yum -y localinstall /mnt/ice_setup*rpm'
+    }.get(cal_svr.system_type, None)
+    if not args:
+        raise RuntimeError('{0}: unknown system type'.format(cal_svr))
+    ret = cal_svr.run(args=args)
     if ret.exitstatus:
-        raise RuntimeError('remote tar failed')
+        raise RuntimeError('ice_setup package install failed')
+
+    # Run ice_setup
     icesetdata = 'yes\n\n%s\nhttp\n' % client_id
     ice_in = StringIO(icesetdata)
-    ice_setup_io = StringIO()
-    ret = cal_svr.run(args=['sudo', 'python', 'ice_setup.py'], stdin=ice_in,
-                      stdout=ice_setup_io)
-    log.debug(ice_setup_io.getvalue())
-    # Run Calamari-ceph connect.
+    ice_out = StringIO()
+    args = 'sudo ice_setup'
+    if icetype == 'iso':
+        args += ' -d /mnt'
+    ret = cal_svr.run(args=args, stdin=ice_in, stdout=ice_out)
+    log.debug(ice_out.getvalue())
     if ret.exitstatus:
         raise RuntimeError('ice_setup.py failed')
-    icesetdata = '%s\n%s\n%s\n%s\n' % (calamari_user, email, calamari_password,
-                                       calamari_password)
+
+    # Run calamari-ctl initialize.
+    icesetdata = '%s\n%s\n%s\n%s\n' % (
+        config['calamari_user'],
+        config['email'],
+        config['calamari_password'],
+        config['calamari_password'],
+    )
     ice_in = StringIO(icesetdata)
     ret = cal_svr.run(args=['sudo', 'calamari-ctl', 'initialize'],
-                      stdin=ice_in, stdout=ice_setup_io)
-    log.debug(ice_setup_io.getvalue())
+                      stdin=ice_in, stdout=ice_out)
+    log.debug(ice_out.getvalue())
     if ret.exitstatus:
         raise RuntimeError('calamari-ctl initialize failed')
     try:
@@ -270,7 +260,7 @@ def calamari_install(config, cal_svr):
     finally:
         log.info('Cleaning up after Calamari installation')
         if delete_iceball:
-            os.unlink(gz_file)
+            os.unlink(iceball_file)
 
 
 @contextlib.contextmanager
@@ -312,7 +302,7 @@ def deploy_ceph(ctx, cal_svr):
             if daemon_type == 'mon':
                 all_mons.add(remote.shortname)
     first_cmds = [['new'] + list(all_mons), ['install'] + list(all_machines),
-                  ['mon', 'create-initial'] ]
+                  ['mon', 'create-initial']]
     ret = True
     for entry in first_cmds:
         arg_list = ['ceph-deploy'] + entry
@@ -346,7 +336,7 @@ def undeploy_ceph(ctx, cal_svr):
     for remote in ctx.cluster.remotes:
         ret &= remote.run(args=['sudo', 'stop', 'ceph-all', run.Raw('||'),
                                 'sudo', 'service', 'ceph', 'stop']
-                         ).exitstatus
+                          ).exitstatus
         all_machines.append(remote.shortname)
     all_machines = set(all_machines)
     cmd1 = ['ceph-deploy', 'uninstall']

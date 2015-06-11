@@ -68,10 +68,17 @@ class FuseMount(CephFSMount):
         run_cmd.extend(run_cmd_tail)
 
         def list_connections():
+            self.client_remote.run(
+                args=["sudo", "mount", "-t", "fusectl", "/sys/fs/fuse/connections", "/sys/fs/fuse/connections"],
+                check_status=False
+            )
             p = self.client_remote.run(
                 args=["ls", "/sys/fs/fuse/connections"],
-                stdout=StringIO()
+                stdout=StringIO(),
+                check_status=False
             )
+            if p.exitstatus != 0:
+                return []
 
             ls_str = p.stdout.getvalue().strip()
             if ls_str:
@@ -340,3 +347,13 @@ print find_socket("{client_name}")
         """
         status = self._admin_socket(['status'])
         return status['osd_epoch'], status['osd_epoch_barrier']
+
+    def get_dentry_count(self):
+        """
+        Return 2-tuple of dentry_count, dentry_pinned_count
+        """
+        status = self._admin_socket(['status'])
+        return status['dentry_count'], status['dentry_pinned_count']
+
+    def set_cache_size(self, size):
+        return self._admin_socket(['config', 'set', 'client_cache_size', str(size)])
